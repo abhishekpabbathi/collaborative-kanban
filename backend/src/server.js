@@ -191,6 +191,70 @@ async function start() {
     );
   }
 
+  // Demo login accounts for deployment testing.
+  async function ensureDemoAccounts() {
+    const orgEmail = "collaborativekanban@gmail.com";
+    const adminEmail = "anil@gmail.com";
+    const memberEmail = "alex.morgan@collabkanban.demo";
+
+    let org = one("SELECT id FROM organizations WHERE name=?", ["Organization Admin"]);
+    if (!org) {
+      org = { id: id() };
+      db.run("INSERT INTO organizations(id,name) VALUES(?,?)",
+        [org.id, "Organization Admin"]);
+    }
+
+    function ensureTenant(name) {
+      let tenant = one(
+        "SELECT id FROM tenants WHERE organization_id=? AND name=?",
+        [org.id, name]
+      );
+      if (!tenant) {
+        tenant = { id: id() };
+        db.run("INSERT INTO tenants(id,organization_id,name) VALUES(?,?,?)",
+          [tenant.id, org.id, name]);
+      }
+      return tenant;
+    }
+
+    const adminWorkspace = ensureTenant("Admin Workspace");
+    const anilWorkspace = ensureTenant("Anil Workspace");
+
+    async function ensureUser(name, email, password, tenant, role) {
+      let user = one("SELECT id FROM users WHERE email=?", [email]);
+      const hash = await bcrypt.hash(password, 12);
+
+      if (user) {
+        db.run("UPDATE users SET password=? WHERE id=?", [hash, user.id]);
+      } else {
+        user = { id: id() };
+        db.run("INSERT INTO users(id,name,email,password) VALUES(?,?,?,?)",
+          [user.id, name, email, hash]);
+      }
+
+      if (!one("SELECT id FROM memberships WHERE user_id=? AND tenant_id=?",
+        [user.id, tenant.id])) {
+        db.run(
+          "INSERT INTO memberships(id,user_id,organization_id,tenant_id,role) VALUES(?,?,?,?,?)",
+          [id(), user.id, org.id, tenant.id, role]
+        );
+      }
+    }
+
+    await ensureUser("Collaborative Kanban", orgEmail,
+      "OrgDemo@2026-Kanban!", adminWorkspace, "ORG_ADMIN");
+    await ensureUser("Anil", adminEmail,
+      "AnilDemo@2026-Kanban!", anilWorkspace, "TENANT_ADMIN");
+    await ensureUser("Alex Morgan", memberEmail,
+      "MemberDemo@2026-Kanban!", anilWorkspace, "MEMBER");
+
+    save();
+    console.log("Demo accounts ready: ORG_ADMIN, TENANT_ADMIN, MEMBER");
+  }
+
+  await ensureDemoAccounts();
+  seedOrganizationAdminWorkspace();
+
   const app = express();
   const server = http.createServer(app);
   const io = new (require("socket.io").Server)(server, {
