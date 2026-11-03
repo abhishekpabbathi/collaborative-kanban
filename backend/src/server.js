@@ -159,7 +159,9 @@ async function start() {
   // Backward-compatible task metadata migration.
   for (const statement of [
     "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'Medium'",
-    "ALTER TABLE tasks ADD COLUMN due_date TEXT DEFAULT NULL"
+    "ALTER TABLE tasks ADD COLUMN due_date TEXT DEFAULT NULL",
+    "ALTER TABLE tasks ADD COLUMN assignee_id TEXT DEFAULT NULL",
+    "ALTER TABLE tasks ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'"
   ]) {
     try { db.run(statement); } catch (error) {
       if (!String(error.message || error).toLowerCase().includes("duplicate column"))
@@ -255,6 +257,99 @@ async function start() {
   await ensureDemoAccounts();
   seedOrganizationAdminWorkspace();
 
+  // Idempotent demo data for Alex Morgan's Member workspace.
+  function seedMemberWorkspace() {
+    const member = one(
+      `SELECT u.id AS userId, m.tenant_id AS tenantId
+       FROM users u JOIN memberships m ON m.user_id=u.id
+       WHERE lower(u.email)=? AND m.role='MEMBER' LIMIT 1`,
+      ["alex.morgan@collabkanban.demo"]
+    );
+    if (!member) throw new Error("Member demo account or workspace not found.");
+
+    const starterBoards = [
+      {
+        name: "Product Development",
+        tasks: [
+          ["To Do", "Create task detail panel", "Design a clear panel for viewing task descriptions and updates.", "High", ["UI", "Frontend"], 3],
+          ["To Do", "Define API validation", "Document validation rules for task fields and assignments.", "Medium", ["Backend"], 5],
+          ["In Progress", "Implement Kanban drag and drop", "Allow members to move tasks between workflow columns.", "High", ["Kanban", "Frontend"], 2],
+          ["In Progress", "Add task search and filters", "Support searching tasks by title and filtering by priority.", "Medium", ["Search"], 4],
+          ["Done", "Configure member authentication", "Verify member login and workspace access.", "High", ["Authentication"], 1]
+        ]
+      },
+      {
+        name: "Bug Tracking",
+        tasks: [
+          ["To Do", "Verify due date validation", "Test valid and invalid task due dates.", "Medium", ["Testing"], 4],
+          ["To Do", "Test empty board state", "Check helpful guidance when a board has no tasks.", "Low", ["UI"], 6],
+          ["In Progress", "Fix task card overflow", "Ensure long task titles and descriptions display correctly.", "Medium", ["UI", "Bug"], 2],
+          ["In Progress", "Investigate stale board refresh", "Verify task changes appear after refreshing workspace data.", "High", ["Real-time", "Bug"], 3],
+          ["Done", "Resolve login loading state", "Ensure login requests finish and display useful errors.", "High", ["Authentication"], 1]
+        ]
+      },
+      {
+        name: "Feature Improvements",
+        tasks: [
+          ["To Do", "Add keyboard navigation", "Improve keyboard access to task actions and navigation.", "Low", ["Accessibility"], 8],
+          ["To Do", "Improve mobile board layout", "Make board columns usable on smaller screens.", "Medium", ["Responsive"], 7],
+          ["In Progress", "Build activity timeline", "Show recent task creation and status updates.", "Medium", ["Activity"], 4],
+          ["In Progress", "Improve task priority indicators", "Make task priority easier to identify on cards.", "Low", ["UI"], 5],
+          ["Done", "Add task labels", "Support labels for organizing related work.", "Medium", ["Labels"], 1]
+        ]
+      }
+    ];
+
+    for (const item of starterBoards) {
+      let board = one(
+        "SELECT id FROM boards WHERE tenant_id=? AND name=?",
+        [member.tenantId, item.name]
+      );
+
+      if (!board) {
+        board = { id: id() };
+        db.run("INSERT INTO boards(id,tenant_id,name) VALUES(?,?,?)",
+          [board.id, member.tenantId, item.name]);
+      }
+
+      const columnNames = ["To Do", "In Progress", "Done"];
+      for (let position = 0; position < columnNames.length; position++) {
+        const name = columnNames[position];
+        if (!one("SELECT id FROM columns WHERE board_id=? AND name=?", [board.id, name])) {
+          db.run("INSERT INTO columns(id,board_id,name,position) VALUES(?,?,?,?)",
+            [id(), board.id, name, position]);
+        }
+      }
+
+      for (const [columnName, title, description, priority, labels, days] of item.tasks) {
+        const column = one(
+          "SELECT id FROM columns WHERE board_id=? AND name=?",
+          [board.id, columnName]
+        );
+        if (!column || one("SELECT id FROM tasks WHERE column_id=? AND title=?", [column.id, title])) continue;
+
+        const taskId = id();
+        const dueDate = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+        const position = rows("SELECT id FROM tasks WHERE column_id=?", [column.id]).length;
+
+        db.run(
+          `INSERT INTO tasks(id,column_id,title,description,priority,due_date,position,assignee_id,labels)
+           VALUES(?,?,?,?,?,?,?,?,?)`,
+          [taskId, column.id, title, description, priority, dueDate, position,
+           member.userId, JSON.stringify(labels)]
+        );
+        log(member.userId, member.tenantId, taskId, "TASK_CREATED",
+          "Member workspace demo task: " + title);
+      }
+    }
+
+    save();
+    console.log("Member workspace demo data ready.");
+  }
+
+  seedMemberWorkspace();
+
+
   const app = express();
   const server = http.createServer(app);
   const io = new (require("socket.io").Server)(server, {
@@ -323,7 +418,15 @@ async function start() {
     const user = one("SELECT * FROM users WHERE email=?", [(email || "").toLowerCase()]);
     if (!user || !await bcrypt.compare(password || "", user.password))
       return res.status(401).json({ error: "Invalid email or password" });
-    const membership = one("SELECT * FROM memberships WHERE user_id=? AND (? IS NULL OR role=?) LIMIT 1", [user.id, expectedRole || null, expectedRole || null]);
+    const membership = one(
+      `SELECT * FROM memberships
+       WHERE user_id=? AND (? IS NULL OR role=?)
+       ORDER BY CASE WHEN ?='TENANT_ADMIN'
+         THEN (SELECT COUNT(*) FROM boards b WHERE b.tenant_id=memberships.tenant_id)
+         ELSE 0 END DESC, rowid ASC
+       LIMIT 1`,
+      [user.id, expectedRole || null, expectedRole || null, expectedRole || null]
+    );
     if (!membership) return res.status(403).json({ error: "No workspace membership found" });
     if (expectedRole && membership.role !== expectedRole)
       return res.status(403).json({ error: "This account does not have the requested role" });
@@ -474,7 +577,10 @@ async function start() {
       columns: rows("SELECT * FROM columns WHERE board_id=? ORDER BY position", [board.id])
         .map(column => ({
           ...column,
-          tasks: rows("SELECT * FROM tasks WHERE column_id=? ORDER BY position", [column.id])
+          tasks: rows(
+            "SELECT t.*,u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_id WHERE t.column_id=? ORDER BY t.position",
+            [column.id]
+          ).map(task => ({ ...task, labels: JSON.parse(task.labels || "[]") }))
         }))
     })));
   });
@@ -586,8 +692,15 @@ async function start() {
     res.json({ success: true });
   });
 
-  app.post("/api/tenants/:tenantId/tasks", auth, tenantAccess, roleAccess("ORG_ADMIN", "TENANT_ADMIN"), (req, res) => {
+  app.post("/api/tenants/:tenantId/tasks", auth, tenantAccess, (req, res) => {
     const { columnId, title, description = "", priority = "Medium", dueDate = null } = req.body;
+    const assigneeId = req.body.assigneeId || null;
+    const labels = req.body.labels ?? [];
+    if (!Array.isArray(labels) || labels.length > 10 ||
+        labels.some(label => typeof label !== "string" || !label.trim() || label.trim().length > 30))
+      return res.status(400).json({ error: "Labels must be up to 10 names, each 1–30 characters" });
+    if (assigneeId && !one("SELECT id FROM memberships WHERE user_id=? AND tenant_id=?", [assigneeId, req.tenantId]))
+      return res.status(400).json({ error: "Assignee must be a member of this workspace" });
     if (!["Low", "Medium", "High", "Urgent"].includes(priority))
       return res.status(400).json({ error: "Invalid task priority" });
     if (dueDate !== null && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate))
@@ -598,8 +711,9 @@ async function start() {
     );
     if (!column || !title?.trim()) return res.status(400).json({ error: "Valid columnId and title required" });
     const taskId = id();
-    db.run("INSERT INTO tasks(id,column_id,title,description,priority,due_date) VALUES(?,?,?,?,?,?)",
-      [taskId, columnId, title.trim(), description, priority, dueDate]);
+    const position = one("SELECT COALESCE(MAX(position),-1)+1 AS next FROM tasks WHERE column_id=?", [columnId]).next;
+    db.run("INSERT INTO tasks(id,column_id,title,description,priority,due_date,position,assignee_id,labels) VALUES(?,?,?,?,?,?,?,?,?)",
+      [taskId, columnId, title.trim(), description, priority, dueDate, position, assigneeId, JSON.stringify(labels.map(label => label.trim()))]);
     log(req.user.id, req.tenantId, taskId, "TASK_CREATED", title.trim());
     save();
     io.to(`tenant:${req.tenantId}`).emit("task:created", one("SELECT * FROM tasks WHERE id=?", [taskId]));
@@ -617,34 +731,105 @@ async function start() {
       return res.status(400).json({ error: "A valid task version is required" });
     if (req.body.version !== task.version)
       return res.status(409).json({ error: "Version conflict", current: task });
+
     const title = req.body.title ?? task.title;
     const description = req.body.description ?? task.description;
     const columnId = req.body.columnId ?? task.column_id;
     const priority = req.body.priority ?? task.priority ?? "Medium";
     const dueDate = req.body.dueDate === undefined ? task.due_date : req.body.dueDate;
+    const assigneeId = req.body.assigneeId === undefined ? task.assignee_id : (req.body.assigneeId || null);
+    let labels = task.labels || "[]";
+    if (req.body.labels !== undefined) {
+      if (!Array.isArray(req.body.labels) || req.body.labels.length > 10 ||
+          req.body.labels.some(label => typeof label !== "string" || !label.trim() || label.trim().length > 30))
+        return res.status(400).json({ error: "Labels must be up to 10 names, each 1–30 characters" });
+      labels = JSON.stringify(req.body.labels.map(label => label.trim()));
+    }
+    if (assigneeId && !one("SELECT id FROM memberships WHERE user_id=? AND tenant_id=?", [assigneeId, req.tenantId]))
+      return res.status(400).json({ error: "Assignee must be a member of this workspace" });
+
+    if (typeof title !== "string" || !title.trim())
+      return res.status(400).json({ error: "Task title is required" });
     if (!["Low", "Medium", "High", "Urgent"].includes(priority))
       return res.status(400).json({ error: "Priority must be Low, Medium, High or Urgent" });
     if (dueDate !== null && dueDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate))
       return res.status(400).json({ error: "Due date must use YYYY-MM-DD format" });
+    if (req.body.position !== undefined &&
+        (!Number.isInteger(req.body.position) || req.body.position < 0))
+      return res.status(400).json({ error: "Task position must be a non-negative integer" });
+
     const validColumn = one(
       "SELECT c.id FROM columns c JOIN boards b ON b.id=c.board_id WHERE c.id=? AND b.tenant_id=?",
       [columnId, req.tenantId]
     );
     if (!validColumn) return res.status(400).json({ error: "Invalid destination column" });
-    db.run("UPDATE tasks SET title=?,description=?,column_id=?,priority=?,due_date=?,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?",
-      [title, description, columnId, priority, dueDate, task.id, req.body.version]);
-    if (db.getRowsModified() !== 1) {
-      const current = one("SELECT * FROM tasks WHERE id=?", [task.id]);
-      return res.status(409).json({ error: "Version conflict", current });
+
+    const sourceIds = rows(
+      "SELECT id FROM tasks WHERE column_id=? ORDER BY position,id",
+      [task.column_id]
+    ).map(item => item.id);
+    const sameColumn = task.column_id === columnId;
+    const destinationIds = sameColumn ? sourceIds : rows(
+      "SELECT id FROM tasks WHERE column_id=? ORDER BY position,id",
+      [columnId]
+    ).map(item => item.id);
+
+    const sourceIndex = sourceIds.indexOf(task.id);
+    if (sourceIndex === -1)
+      return res.status(409).json({ error: "Task ordering changed. Refresh and try again." });
+
+    sourceIds.splice(sourceIndex, 1);
+    const targetPosition = Math.min(
+      req.body.position === undefined ? (sameColumn ? sourceIndex : destinationIds.length) : req.body.position,
+      sameColumn ? sourceIds.length : destinationIds.length
+    );
+    const movedIds = sameColumn ? sourceIds : destinationIds;
+    movedIds.splice(targetPosition, 0, task.id);
+
+    try {
+      db.run("BEGIN TRANSACTION");
+
+      db.run(
+        `UPDATE tasks
+         SET title=?,description=?,column_id=?,priority=?,due_date=?,assignee_id=?,labels=?,
+             version=version+1,updated_at=CURRENT_TIMESTAMP
+         WHERE id=? AND version=?`,
+        [title.trim(), description, columnId, priority, dueDate, assigneeId, labels, task.id, req.body.version]
+      );
+
+      if (db.getRowsModified() !== 1) {
+        db.run("ROLLBACK");
+        const current = one("SELECT * FROM tasks WHERE id=?", [task.id]);
+        return res.status(409).json({ error: "Version conflict", current });
+      }
+
+      if (sameColumn) {
+        movedIds.forEach((taskId, position) =>
+          db.run("UPDATE tasks SET position=? WHERE id=?", [position, taskId])
+        );
+      } else {
+        sourceIds.forEach((taskId, position) =>
+          db.run("UPDATE tasks SET position=? WHERE id=?", [position, taskId])
+        );
+        destinationIds.forEach((taskId, position) =>
+          db.run("UPDATE tasks SET position=? WHERE id=?", [position, taskId])
+        );
+      }
+
+      log(req.user.id, req.tenantId, task.id, "TASK_UPDATED", title.trim());
+      db.run("COMMIT");
+      save();
+    } catch (error) {
+      try { db.run("ROLLBACK"); } catch {}
+      throw error;
     }
-    log(req.user.id, req.tenantId, task.id, "TASK_UPDATED", title);
-    save();
+
     const updated = one("SELECT * FROM tasks WHERE id=?", [task.id]);
     io.to(`tenant:${req.tenantId}`).emit("task:updated", updated);
     res.json(updated);
   });
 
-  app.delete("/api/tenants/:tenantId/tasks/:taskId", auth, tenantAccess, roleAccess("ORG_ADMIN", "TENANT_ADMIN"), (req, res) => {
+  app.delete("/api/tenants/:tenantId/tasks/:taskId", auth, tenantAccess, (req, res) => {
     const task = one(
       `SELECT t.* FROM tasks t JOIN columns c ON c.id=t.column_id
        JOIN boards b ON b.id=c.board_id WHERE t.id=? AND b.tenant_id=?`,
@@ -653,6 +838,8 @@ async function start() {
     if (!task) return res.status(404).json({ error: "Task not found" });
     log(req.user.id, req.tenantId, task.id, "TASK_DELETED", task.title);
     db.run("DELETE FROM tasks WHERE id=?", [task.id]);
+    rows("SELECT id FROM tasks WHERE column_id=? ORDER BY position,id", [task.column_id])
+      .forEach((item, position) => db.run("UPDATE tasks SET position=? WHERE id=?", [position, item.id]));
     save();
     io.to(`tenant:${req.tenantId}`).emit("task:deleted", { id: task.id });
     res.json({ success: true });
